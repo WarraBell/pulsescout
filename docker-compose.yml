@@ -1,0 +1,86 @@
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://localhost:8000/api
+    networks:
+      - pulsescout-network
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+    environment:
+      - DATABASE_URL=postgresql://pulsescout:pulsescout@postgres:5432/pulsescout
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - SECRET_KEY=dev_secret_key_change_in_production
+    networks:
+      - pulsescout-network
+
+  celery:
+    build: ./backend
+    command: celery -A app.celery worker --loglevel=info
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - backend
+      - rabbitmq
+    environment:
+      - DATABASE_URL=postgresql://pulsescout:pulsescout@postgres:5432/pulsescout
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - SECRET_KEY=dev_secret_key_change_in_production
+    networks:
+      - pulsescout-network
+
+  postgres:
+    image: postgres:latest
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=pulsescout
+      - POSTGRES_PASSWORD=pulsescout
+      - POSTGRES_DB=pulsescout
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - pulsescout-network
+
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - pulsescout-network
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - pulsescout-network
+
+networks:
+  pulsescout-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:

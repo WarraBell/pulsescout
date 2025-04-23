@@ -1,0 +1,503 @@
+# app/utils/subscription_utils.py
+from fastapi import HTTPException, status, Depends
+from sqlalchemy.orm import Session
+from app.api.models.user import User, Subscription
+from app.services.subscription_service import SubscriptionService
+from app.db.database import get_db
+from typing import Dict, Any, Callable, Optional
+from functools import wraps
+
+
+async def check_lead_limit(user_id: str, count: int, db: Session):
+    """
+    Check if user has enough leads remaining in their subscription.
+    
+    Args:
+        user_id: User ID
+        count: Number of leads to check
+        db: Database session
+        
+    Returns:
+        True if user has enough leads, False otherwise
+    
+    Raises:
+        HTTPException: If user doesn't have enough leads or no active subscription
+    """
+    # Get user's subscription
+    subscription = await SubscriptionService.get_subscription_with_plan(db, user_id)
+    
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="No active subscription found"
+        )
+    
+    # Check if user is within limit
+    leads_remaining = subscription.plan.leads_per_month - subscription.leads_used_this_month
+    
+    if leads_remaining < count:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"You have {leads_remaining} leads remaining this month, but requested {count} leads"
+        )
+    
+    return True
+
+
+async def increment_lead_usage(user_id: str, count: int, db: Session):
+    """
+    Increment the lead usage count for a user's subscription.
+    
+    Args:
+        user_id: User ID
+        count: Number of leads to increment
+        db: Database session
+        
+    Returns:
+        Updated subscription
+    """
+    try:
+        subscription = await SubscriptionService.track_lead_usage(db, user_id, count)
+        return subscription
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+def requires_subscription_feature(feature_name: str):
+    """
+    Dependency function to check if a user's subscription includes a specific feature.
+    
+    Args:
+        feature_name: Name of the feature to check (e.g., "allows_csv_export")
+        
+    Returns:
+        Dependency function
+    """
+    async def dependency(
+        current_user: User = Depends(User),
+        db: Session = Depends(get_db)
+    ):
+        # Get user's subscription
+        subscription = await SubscriptionService.get_subscription_with_plan(db, current_user.id)
+        
+        if not subscription:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail="No active subscription found"
+            )
+        
+        # Check if plan allows the feature
+        plan = subscription.plan
+        has_feature = getattr(plan, feature_name, False)
+        
+        if not has_feature:
+            # Convert feature name to a more readable format
+            feature_display = feature_name.replace("allows_", "").replace("_", " ")
+            
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Your current plan does not include the {feature_display} feature"
+            )
+        
+        return True
+    
+    return dependency
+
+
+def get_user_plan_tier(user_id: str, db: Session) -> Optional[str]:
+    """
+    Get the tier/level of the user's subscription plan.
+    
+    Args:
+        user_id: User ID
+        db: Database session
+        
+    Returns:
+        Plan name (e.g., "Free Trial", "Starter", "Growth", "Scale", "Pro+") or None if no subscription
+    """
+    subscription = db.query(Subscription).filter(
+        Subscription.user_id == user_id,
+        Subscription.status.in_(["active", "trialing"])
+    ).first()
+    
+    if not subscription or not subscription.plan:
+        return None
+    
+    return subscription.plan.name
+
+
+def get_feature_availability(user_id: str, db: Session) -> Dict[str, bool]:
+    """
+    Get a dictionary of all subscription features and their availability for a user.
+    
+    Args:
+        user_id: User ID
+        db: Database session
+        
+    Returns:
+        Dictionary mapping feature names to boolean values
+    """
+    subscription = db.query(Subscription).filter(
+        Subscription.user_id == user_id,
+        Subscription.status.in_(["active", "trialing"])
+    ).first()
+    
+    if not subscription or not subscription.plan:
+        return {
+            "csv_export": False,
+            "crm_sync": False,
+            "team_access": False,
+            "api_access": False,
+            "white_labeling": False,
+            "enrichment": False
+        }
+    
+    plan = subscription.plan
+    
+    return {
+        "csv_export": plan.allows_csv_export,
+        "crm_sync": plan.allows_crm_sync,
+        "team_access": plan.allows_team_access,
+        "api_access": plan.allows_api_access,
+        "white_labeling": plan.allows_white_labeling,
+        "enrichment": plan.allows_enrichment
+    }
+
+
+def check_team_member_limit(user_id: str, db: Session) -> Dict[str, Any]:
+    """
+    Check how many team members a user can have and how many they currently have.
+    
+    Args:
+        user_id: User ID
+        db: Database session
+        
+    Returns:
+        Dictionary with current count, max allowed, and whether the limit is reached
+    """
+    from app.api.models.user import TeamMember
+    
+    # Get user's subscription
+    subscription = db.query(Subscription).filter(
+        Subscription.user_id == user_id,
+        Subscription.status.in_(["active", "trialing"])
+    ).first()
+    
+    if not subscription or not subscription.plan:
+        return {
+            "current_count": 0,
+            "max_allowed": 0,
+            "limit_reached": True
+        }
+    
+    # Get current team member count
+    current_count = db.query(TeamMember).filter(
+        TeamMember.owner_id == user_id
+    ).count()
+    
+    max_allowed = subscription.plan.max_team_members
+    
+    return {
+        "current_count": current_count,
+        "max_allowed": max_allowed,
+        "limit_reached": current_count >= max_allowed
+    }
+
+
+def is_subscription_due_for_renewal(user_id: str, db: Session, days_threshold: int = 7) -> bool:
+    """
+    Check if a user's subscription is due for renewal within the specified number of days.
+    
+    Args:
+        user_id: User ID
+        db: Database session
+        days_threshold: Number of days threshold for renewal notification
+        
+    Returns:
+        True if subscription is due for renewal within threshold, False otherwise
+    """
+    subscription = db.query(Subscription).filter(
+        Subscription.user_id == user_id,
+        Subscription.status.in_(["active", "trialing"])
+    ).first()
+    
+    if not subscription:
+        return False
+    
+    # Calculate the date threshold
+    renewal_threshold = datetime.utcnow() + timedelta(days=days_threshold)
+    
+    # Check if the subscription end date is within the threshold
+    return subscription.current_period_end <= renewal_threshold
+
+
+def subscription_status_info(user_id: str, db: Session) -> Dict[str, Any]:
+    """
+    Get comprehensive information about a user's subscription status.
+    
+    Args:
+        user_id: User ID
+        db: Database session
+        
+    Returns:
+        Dictionary with subscription status details
+    """
+    # Get user's subscription with plan details
+    subscription = db.query(Subscription).join(Plan).filter(
+        Subscription.user_id == user_id,
+        Subscription.status.in_(["active", "trialing"])
+    ).first()
+    
+    if not subscription:
+        return {
+            "has_subscription": False,
+            "status": None,
+            "plan_name": None,
+            "renewal_date": None,
+            "is_trial": False,
+            "leads_remaining": 0,
+            "leads_used": 0,
+            "leads_total": 0,
+            "features": {},
+            "is_due_for_renewal": False
+        }
+    
+    # Get plan details and feature availability
+    features = get_feature_availability(user_id, db)
+    
+    # Calculate remaining leads
+    leads_used = subscription.leads_used_this_month
+    leads_total = subscription.plan.leads_per_month
+    leads_remaining = leads_total - leads_used
+    
+    # Check if due for renewal
+    is_due_for_renewal = is_subscription_due_for_renewal(user_id, db)
+    
+    return {
+        "has_subscription": True,
+        "status": subscription.status,
+        "plan_name": subscription.plan.name,
+        "renewal_date": subscription.current_period_end,
+        "is_trial": subscription.status == "trialing",
+        "leads_remaining": leads_remaining,
+        "leads_used": leads_used,
+        "leads_total": leads_total,
+        "features": features,
+        "is_due_for_renewal": is_due_for_renewal,
+        "cancel_at_period_end": subscription.cancel_at_period_end
+    }
+
+
+def get_subscription_details(user_id: str, db: Session) -> Dict[str, Any]:
+    """
+    Get detailed information about a user's subscription for display in user dashboard.
+    
+    Args:
+        user_id: User ID
+        db: Database session
+        
+    Returns:
+        Dictionary with subscription details for display
+    """
+    # Get basic subscription status
+    status_info = subscription_status_info(user_id, db)
+    
+    # Get payment history
+    payment_history = db.query(PaymentHistory).filter(
+        PaymentHistory.user_id == user_id
+    ).order_by(PaymentHistory.created_at.desc()).limit(5).all()
+    
+    # Format payment history
+    formatted_history = []
+    for payment in payment_history:
+        formatted_history.append({
+            "id": str(payment.id),
+            "amount": payment.amount,
+            "status": payment.status,
+            "description": payment.description,
+            "date": payment.created_at
+        })
+    
+    # Get team member information if applicable
+    team_info = check_team_member_limit(user_id, db) if status_info["has_subscription"] else {
+        "current_count": 0,
+        "max_allowed": 0,
+        "limit_reached": True
+    }
+    
+    # Get usage trends (simplified for now)
+    usage_trend = db.query(UsageLog).filter(
+        UsageLog.user_id == user_id,
+        UsageLog.action == "search"
+    ).count()
+    
+    return {
+        **status_info,
+        "payment_history": formatted_history,
+        "team_members": team_info,
+        "usage_trend": usage_trend
+    }
+
+
+def calculate_next_billing_amount(user_id: str, db: Session) -> float:
+    """
+    Calculate the expected amount for the next billing cycle.
+    
+    Args:
+        user_id: User ID
+        db: Database session
+        
+    Returns:
+        Expected amount for next billing
+    """
+    subscription = db.query(Subscription).join(Plan).filter(
+        Subscription.user_id == user_id,
+        Subscription.status.in_(["active", "trialing"])
+    ).first()
+    
+    if not subscription:
+        return 0.0
+    
+    # If subscription is set to cancel, return 0
+    if subscription.cancel_at_period_end:
+        return 0.0
+    
+    # Otherwise return plan price
+    return subscription.plan.price
+
+
+def check_subscription_expiry(db: Session) -> None:
+    """
+    Check for expired subscriptions and update their status.
+    Should be run as a scheduled task daily.
+    
+    Args:
+        db: Database session
+    """
+    now = datetime.utcnow()
+    
+    # Find subscriptions that have ended but status isn't updated
+    expired_subscriptions = db.query(Subscription).filter(
+        Subscription.status.in_(["active", "trialing"]),
+        Subscription.current_period_end < now,
+        Subscription.cancel_at_period_end == True
+    ).all()
+    
+    # Update status to canceled
+    for subscription in expired_subscriptions:
+        subscription.status = "canceled"
+        subscription.updated_at = now
+    
+    # Commit all changes at once
+    if expired_subscriptions:
+        db.commit()
+
+
+def calculate_lead_usage_percentage(user_id: str, db: Session) -> float:
+    """
+    Calculate what percentage of their lead limit a user has used.
+    
+    Args:
+        user_id: User ID
+        db: Database session
+        
+    Returns:
+        Percentage of lead limit used (0-100)
+    """
+    subscription = db.query(Subscription).join(Plan).filter(
+        Subscription.user_id == user_id,
+        Subscription.status.in_(["active", "trialing"])
+    ).first()
+    
+    if not subscription or subscription.plan.leads_per_month == 0:
+        return 100.0
+    
+    usage_percentage = (subscription.leads_used_this_month / subscription.plan.leads_per_month) * 100
+    return min(usage_percentage, 100.0)  # Cap at 100%
+
+
+def can_access_feature(user_id: str, feature_name: str, db: Session) -> bool:
+    """
+    Check if a user can access a specific feature based on their subscription.
+    Use this for programmatic checking rather than as a dependency.
+    
+    Args:
+        user_id: User ID
+        feature_name: Name of the feature to check
+        db: Database session
+        
+    Returns:
+        True if user can access the feature, False otherwise
+    """
+    # Get user's subscription
+    subscription = db.query(Subscription).join(Plan).filter(
+        Subscription.user_id == user_id,
+        Subscription.status.in_(["active", "trialing"])
+    ).first()
+    
+    if not subscription:
+        return False
+    
+    # Check if plan allows the feature
+    return getattr(subscription.plan, f"allows_{feature_name}", False)
+
+
+def suggest_plan_upgrade(user_id: str, db: Session, needed_feature: str = None) -> Dict[str, Any]:
+    """
+    Suggest a plan upgrade for a user based on their current usage or needed feature.
+    
+    Args:
+        user_id: User ID
+        db: Database session
+        needed_feature: Feature name the user might need
+        
+    Returns:
+        Dictionary with suggested plan details
+    """
+    # Get user's current subscription
+    current_subscription = db.query(Subscription).join(Plan).filter(
+        Subscription.user_id == user_id,
+        Subscription.status.in_(["active", "trialing"])
+    ).first()
+    
+    # Get all plans ordered by price
+    all_plans = db.query(Plan).order_by(Plan.price).all()
+    
+    # Determine current plan index
+    current_plan_index = -1
+    if current_subscription:
+        for i, plan in enumerate(all_plans):
+            if plan.id == current_subscription.plan_id:
+                current_plan_index = i
+                break
+    
+    # Find suitable upgrade plan
+    suggested_plan = None
+    
+    if needed_feature:
+        # Find the cheapest plan that has the needed feature
+        feature_attr = f"allows_{needed_feature}"
+        for plan in all_plans:
+            if getattr(plan, feature_attr, False) and (current_plan_index == -1 or plan.price > all_plans[current_plan_index].price):
+                suggested_plan = plan
+                break
+    elif current_plan_index < len(all_plans) - 1:
+        # Suggest the next tier plan
+        suggested_plan = all_plans[current_plan_index + 1]
+    
+    if not suggested_plan:
+        return {
+            "has_suggestion": False
+        }
+    
+    return {
+        "has_suggestion": True,
+        "plan_id": str(suggested_plan.id),
+        "plan_name": suggested_plan.name,
+        "plan_price": suggested_plan.price,
+        "plan_features": suggested_plan.features,
+        "leads_per_month": suggested_plan.leads_per_month
+    }
